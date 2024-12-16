@@ -1,0 +1,101 @@
+import os
+import random
+from torch.utils.data import Dataset
+from PIL import Image
+import torch
+
+
+class TrainFrameSampler:
+    def __init__(self, speed=[0.5, 1, 2, 3, 4, 5]):
+        self.speed = speed
+
+    def __call__(self, seq_length):
+        frames = list(range(seq_length))
+
+        # Speed up
+        speed = random.choice(self.speed)
+        frames = [int(f * speed) for f in frames]
+
+        # Shift
+        shift = random.choice(range(seq_length))
+        frames = [f + shift for f in frames]
+
+        # Reverse
+        if random.random() < 0.5:
+            frames = frames[::-1]
+
+        return frames
+class VideoMatteDataset(Dataset):
+    def __init__(self,
+                 videomatte_dir,
+                 background_image_dir,
+                 size,
+                 seq_length,
+                 seq_sampler,
+                 transform=None):
+        self.background_image_dir = background_image_dir
+        self.background_image_files = os.listdir(background_image_dir)
+
+        self.videomatte_dir = videomatte_dir
+        self.videomatte_clips = sorted(os.listdir(os.path.join(videomatte_dir, 'fgr')))
+        self.videomatte_frames = [sorted(os.listdir(os.path.join(videomatte_dir, 'fgr', clip)))
+                                  for clip in self.videomatte_clips]
+        self.videomatte_idx = [(clip_idx, frame_idx)
+                               for clip_idx in range(len(self.videomatte_clips))
+                               for frame_idx in range(0, len(self.videomatte_frames[clip_idx]), seq_length)]
+        self.size = size
+        self.seq_length = seq_length
+        self.seq_sampler = seq_sampler
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.videomatte_idx)
+
+    def __getitem__(self, idx):
+        bgrs = self._get_random_image_background()
+        fgrs = self._get_videomatte(idx)
+
+        # Define the transformation process to convert PIL images to tensors
+        # and resize them to a common size
+        transform = transforms.Compose([
+            transforms.Resize((self.size, self.size)),  # Resize images to the same size
+            transforms.ToTensor()  # Convert images to PyTorch tensors
+        ])
+
+        # Apply transformation to each image in the list
+        fgrs = [transform(fgr) for fgr in fgrs]
+        bgrs = [transform(bgr) for bgr in bgrs]
+
+        # Stack the list of tensors along a new dimension
+        fgrs = torch.stack(fgrs, dim=0)
+        bgrs = torch.stack(bgrs, dim=0)
+
+        return fgrs, bgrs
+
+    def _get_random_image_background(self):
+        with Image.open(os.path.join(self.background_image_dir, random.choice(self.background_image_files))) as bgr:
+            bgr = self._downsample_if_needed(bgr.convert('RGB'))
+        bgrs = [bgr] * self.seq_length
+        return bgrs
+
+    def _get_videomatte(self, idx):
+        clip_idx, frame_idx = self.videomatte_idx[idx]
+        clip = self.videomatte_clips[clip_idx]
+        frame_count = len(self.videomatte_frames[clip_idx])
+        fgrs = []
+        for i in self.seq_sampler(self.seq_length):
+            frame = self.videomatte_frames[clip_idx][(frame_idx + i) % frame_count]
+            with Image.open(os.path.join(self.videomatte_dir, 'fgr', clip, frame)) as fgr:
+                    fgr = self._downsample_if_needed(fgr.convert('RGB'))
+
+            fgrs.append(fgr)
+
+        return fgrs
+    def _downsample_if_needed(self, img):
+        w, h = img.size
+        if min(w, h) > self.size:
+            scale = self.size / min(w, h)
+            w = int(scale * w)
+            h = int(scale * h)
+            img = img.resize((w, h))
+        return img
